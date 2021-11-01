@@ -6,9 +6,6 @@
     __stack_chk_guard;
     asprintf;
     bitvector_*;
-    ev_break;
-    get_exename;
-    getlocalip;
     int32hash;
     int64hash;
     int64to32hash;
