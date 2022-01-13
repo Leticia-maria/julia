@@ -1931,6 +1931,36 @@ jl_code_instance_t *jl_method_compiled(jl_method_instance_t *mi, size_t world)
     return NULL;
 }
 
+static void record_precompile_statement(jl_method_instance_t *mi)
+{
+    static ios_t f_precompile;
+    static JL_STREAM* s_precompile = NULL;
+    jl_method_t *def = mi->def.method;
+    if (jl_options.trace_compile == NULL)
+        return;
+    if (!jl_is_method(def))
+        return;
+
+    if (s_precompile == NULL) {
+        const char *t = jl_options.trace_compile;
+        if (!strncmp(t, "stderr", 6)) {
+            s_precompile = JL_STDERR;
+        }
+        else {
+            if (ios_file(&f_precompile, t, 1, 1, 1, 1) == NULL)
+                jl_errorf("cannot open precompile statement file \"%s\" for writing", t);
+            s_precompile = (JL_STREAM*) &f_precompile;
+        }
+    }
+    if (!jl_has_free_typevars(mi->specTypes)) {
+        jl_printf(s_precompile, "precompile(");
+        jl_static_show(s_precompile, mi->specTypes);
+        jl_printf(s_precompile, ")\n");
+        if (s_precompile != JL_STDERR)
+            ios_flush(&f_precompile);
+    }
+}
+
 jl_code_instance_t *jl_compile_method_internal(jl_method_instance_t *mi, size_t world)
 {
     jl_code_instance_t *codeinst = jl_method_compiled(mi, world);
@@ -1946,10 +1976,11 @@ jl_code_instance_t *jl_compile_method_internal(jl_method_instance_t *mi, size_t 
             compile_option = ((jl_method_t*)def)->module->compile;
     }
 
+    // if compilation is disabled or source is unavailable, try calling unspecialized version
     if (compile_option == JL_OPTIONS_COMPILE_OFF ||
-        compile_option == JL_OPTIONS_COMPILE_MIN) {
+        compile_option == JL_OPTIONS_COMPILE_MIN ||
+        def->source == jl_nothing) {
         // copy fptr from the template method definition
-        jl_method_t *def = mi->def.method;
         if (jl_is_method(def) && def->unspecialized) {
             jl_code_instance_t *unspec = jl_atomic_load_relaxed(&def->unspecialized->cache);
             if (unspec && jl_atomic_load_relaxed(&unspec->invoke)) {
@@ -1961,9 +1992,14 @@ jl_code_instance_t *jl_compile_method_internal(jl_method_instance_t *mi, size_t 
                 codeinst->rettype_const = unspec->rettype_const;
                 codeinst->invoke = unspec->invoke;
                 jl_mi_cache_insert(mi, codeinst);
+                record_precompile_statement(mi);
                 return codeinst;
             }
         }
+    }
+    // if that didn't work and compilation is off, try running in the interpreter
+    if (compile_option == JL_OPTIONS_COMPILE_OFF ||
+        compile_option == JL_OPTIONS_COMPILE_MIN) {
         jl_code_info_t *src = jl_code_for_interpreter(mi);
         if (!jl_code_requires_compiler(src)) {
             jl_code_instance_t *codeinst = jl_new_codeinst(mi,
@@ -1971,6 +2007,7 @@ jl_code_instance_t *jl_compile_method_internal(jl_method_instance_t *mi, size_t 
                 0, 1, ~(size_t)0);
             codeinst->invoke = jl_fptr_interpret_call;
             jl_mi_cache_insert(mi, codeinst);
+            record_precompile_statement(mi);
             return codeinst;
         }
         if (compile_option == JL_OPTIONS_COMPILE_OFF) {
@@ -1985,8 +2022,16 @@ jl_code_instance_t *jl_compile_method_internal(jl_method_instance_t *mi, size_t 
         jl_method_instance_t *unspec = jl_get_unspecialized(mi);
         jl_code_instance_t *ucache = jl_get_method_inferred(unspec, (jl_value_t*)jl_any_type, 1, ~(size_t)0);
         // ask codegen to make the fptr for unspec
-        if (jl_atomic_load_relaxed(&ucache->invoke) == NULL)
+        if (jl_atomic_load_relaxed(&ucache->invoke) == NULL) {
+            if (def->source == jl_nothing && (ucache->def->uninferred == jl_nothing ||
+                                              ucache->def->uninferred == NULL)) {
+                jl_printf(JL_STDERR, "source not available for ");
+                jl_static_show(JL_STDERR, (jl_value_t*)mi);
+                jl_printf(JL_STDERR, "\n");
+                jl_error("source missing for method that needs to be compiled");
+            }
             jl_generate_fptr_for_unspecialized(ucache);
+        }
         assert(jl_atomic_load_relaxed(&ucache->invoke) != NULL);
         if (jl_atomic_load_relaxed(&ucache->invoke) != jl_fptr_sparam &&
             jl_atomic_load_relaxed(&ucache->invoke) != jl_fptr_interpret_call) {
@@ -2000,6 +2045,9 @@ jl_code_instance_t *jl_compile_method_internal(jl_method_instance_t *mi, size_t 
         codeinst->rettype_const = ucache->rettype_const;
         codeinst->invoke = ucache->invoke;
         jl_mi_cache_insert(mi, codeinst);
+    }
+    else {
+        record_precompile_statement(mi);
     }
     jl_atomic_store_relaxed(&codeinst->precompile, 1);
     return codeinst;
@@ -3138,7 +3186,7 @@ static jl_value_t *ml_matches(jl_methtable_t *mt, int offs,
             jl_method_t *meth = env.matc->method;
             jl_svec_t *tpenv = env.matc->sparams;
             JL_LOCK(&mt->writelock);
-            cache_method(mt, &mt->cache, (jl_value_t*)mt, type, meth, world, env.min_valid, env.max_valid, tpenv);
+            cache_method(mt, &mt->cache, (jl_value_t*)mt, (jl_tupletype_t*)unw, meth, world, env.min_valid, env.max_valid, tpenv);
             JL_UNLOCK(&mt->writelock);
         }
     }

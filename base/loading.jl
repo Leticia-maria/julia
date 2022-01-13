@@ -7,11 +7,11 @@ const require_lock = ReentrantLock()
 
 if Sys.isunix() && !Sys.isapple()
     # assume case-sensitive filesystems, don't have to do anything
-    isfile_casesensitive(path) = isfile(path)
+    isfile_casesensitive(path) = isaccessiblefile(path)
 elseif Sys.iswindows()
     # GetLongPathName Win32 function returns the case-preserved filename on NTFS.
     function isfile_casesensitive(path)
-        isfile(path) || return false  # Fail fast
+        isaccessiblefile(path) || return false  # Fail fast
         basename(Filesystem.longpath(path)) == basename(path)
     end
 elseif Sys.isapple()
@@ -44,7 +44,7 @@ elseif Sys.isapple()
     # Buffer buf;
     # getattrpath(path, &attr_list, &buf, sizeof(buf), FSOPT_NOFOLLOW);
     function isfile_casesensitive(path)
-        isfile(path) || return false
+        isaccessiblefile(path) || return false
         path_basename = String(basename(path))
         local casepreserved_basename
         header_size = 12
@@ -75,9 +75,38 @@ elseif Sys.isapple()
 else
     # Generic fallback that performs a slow directory listing.
     function isfile_casesensitive(path)
-        isfile(path) || return false
+        isaccessiblefile(path) || return false
         dir, filename = splitdir(path)
         any(readdir(dir) .== filename)
+    end
+end
+
+# Check if the file is accessible. If stat fails return `false`
+
+function isaccessibledir(dir)
+    return try
+        isdir(dir)
+    catch err
+        err isa IOError || rethrow()
+        false
+    end
+end
+
+function isaccessiblefile(file)
+    return try
+        isfile(file)
+    catch err
+        err isa IOError || rethrow()
+        false
+    end
+end
+
+function isaccessiblepath(path)
+    return try
+        ispath(path)
+    catch err
+        err isa IOError || rethrow()
+        false
     end
 end
 
@@ -842,7 +871,7 @@ const TIMING_IMPORTS = Threads.Atomic{Int}(0)
 # returns `true` if require found a precompile cache for this sourcepath, but couldn't load it
 # returns `false` if the module isn't known to be precompilable
 # returns the set of modules restored if the cache load succeeded
-function _require_search_from_serialized(pkg::PkgId, sourcepath::String, depth::Int = 0)
+@constprop :none function _require_search_from_serialized(pkg::PkgId, sourcepath::String, depth::Int = 0)
     t_before = time_ns()
     paths = find_all_in_cache_path(pkg)
     for path_to_try in paths::Vector{String}
@@ -876,8 +905,8 @@ function _require_search_from_serialized(pkg::PkgId, sourcepath::String, depth::
         else
             if TIMING_IMPORTS[] > 0
                 elapsed = round((time_ns() - t_before) / 1e6, digits = 1)
-                tree_prefix = depth == 0 ? "" : "$("  "^(depth-1))┌ "
-                print("$(lpad(elapsed, 9)) ms  ")
+                tree_prefix = depth == 0 ? "" : "  "^(depth-1)*"┌ "
+                print(lpad(elapsed, 9), " ms  ")
                 printstyled(tree_prefix, color = :light_black)
                 println(pkg.name)
             end
@@ -1050,6 +1079,7 @@ const pkgorigins = Dict{PkgId,PkgOrigin}()
 
 function require(uuidkey::PkgId)
     @lock require_lock begin
+    just_loaded_pkg = false
     if !root_module_exists(uuidkey)
         cachefile = _require(uuidkey)
         if cachefile !== nothing
@@ -1059,6 +1089,11 @@ function require(uuidkey::PkgId)
         for callback in package_callbacks
             invokelatest(callback, uuidkey)
         end
+        just_loaded_pkg = true
+    end
+    if just_loaded_pkg && !root_module_exists(uuidkey)
+        error("package `$(uuidkey.name)` did not define the expected \
+              module `$(uuidkey.name)`, check for typos in package module name")
     end
     return root_module(uuidkey)
     end
@@ -1070,7 +1105,7 @@ const module_keys = IdDict{Module,PkgId}() # the reverse
 is_root_module(m::Module) = @lock require_lock haskey(module_keys, m)
 root_module_key(m::Module) = @lock require_lock module_keys[m]
 
-function register_root_module(m::Module)
+@constprop :none function register_root_module(m::Module)
     # n.b. This is called from C after creating a new module in `Base.__toplevel__`,
     # instead of adding them to the binding table there.
     @lock require_lock begin
@@ -1339,7 +1374,7 @@ function load_path_setup_code(load_path::Bool=true)
         code *= """
         append!(empty!(Base.LOAD_PATH), $(repr(load_path)))
         ENV["JULIA_LOAD_PATH"] = $(repr(join(load_path, Sys.iswindows() ? ';' : ':')))
-        Base.ACTIVE_PROJECT[] = nothing
+        Base.set_active_project(nothing)
         """
     end
     return code
@@ -1352,7 +1387,7 @@ function include_package_for_output(pkg::PkgId, input::String, depot_path::Vecto
     append!(empty!(Base.DL_LOAD_PATH), dl_load_path)
     append!(empty!(Base.LOAD_PATH), load_path)
     ENV["JULIA_LOAD_PATH"] = join(load_path, Sys.iswindows() ? ';' : ':')
-    Base.ACTIVE_PROJECT[] = nothing
+    set_active_project(nothing)
     Base._track_dependencies[] = true
     get!(Base.PkgOrigin, Base.pkgorigins, pkg).path = input
     append!(empty!(Base._concrete_dependencies), concrete_deps)
@@ -1701,7 +1736,8 @@ function srctext_files(f::IO, srctextpos::Int64)
 end
 
 # Test to see if this UUID is mentioned in this `Project.toml`; either as
-# the top-level UUID (e.g. that of the project itself) or as a dependency.
+# the top-level UUID (e.g. that of the project itself), as a dependency,
+# or as an extra for Preferences.
 function get_uuid_name(project::Dict{String, Any}, uuid::UUID)
     uuid_p = get(project, "uuid", nothing)::Union{Nothing, String}
     name = get(project, "name", nothing)::Union{Nothing, String}
@@ -1716,6 +1752,16 @@ function get_uuid_name(project::Dict{String, Any}, uuid::UUID)
             end
         end
     end
+    for subkey in ("deps", "extras")
+        subsection = get(project, subkey, nothing)::Union{Nothing, Dict{String, Any}}
+        if subsection !== nothing
+            for (k, v) in subsection
+                if uuid == UUID(v::String)
+                    return k
+                end
+            end
+        end
+    end
     return nothing
 end
 
@@ -1724,22 +1770,36 @@ function get_uuid_name(project_toml::String, uuid::UUID)
     return get_uuid_name(project, uuid)
 end
 
-function collect_preferences(project_toml::String, uuid::UUID)
+# If we've asked for a specific UUID, this function will extract the prefs
+# for that particular UUID.  Otherwise, it returns all preferences.
+function filter_preferences(prefs::Dict{String, Any}, pkg_name)
+    if pkg_name === nothing
+        return prefs
+    else
+        return get(Dict{String, Any}, prefs, pkg_name)::Dict{String, Any}
+    end
+end
+
+function collect_preferences(project_toml::String, uuid::Union{UUID,Nothing})
     # We'll return a list of dicts to be merged
     dicts = Dict{String, Any}[]
 
-    # Get the name of this UUID to this project; if it can't find it, skip out.
     project = parsed_toml(project_toml)
-    pkg_name = get_uuid_name(project, uuid)
-    if pkg_name === nothing
-        return dicts
+    pkg_name = nothing
+    if uuid !== nothing
+        # If we've been given a UUID, map that to the name of the package as
+        # recorded in the preferences section.  If we can't find that mapping,
+        # exit out, as it means there's no way preferences can be set for that
+        # UUID, as we only allow actual dependencies to have preferences set.
+        pkg_name = get_uuid_name(project, uuid)
+        if pkg_name === nothing
+            return dicts
+        end
     end
 
     # Look first inside of `Project.toml` to see we have preferences embedded within there
-    proj = get(project, "preferences", nothing)
-    if proj isa Dict{String, Any}
-        push!(dicts, get(Dict{String, Any}, proj, pkg_name)::Dict{String, Any})
-    end
+    proj_preferences = get(Dict{String, Any}, project, "preferences")::Dict{String, Any}
+    push!(dicts, filter_preferences(proj_preferences, pkg_name))
 
     # Next, look for `(Julia)LocalPreferences.toml` files next to this `Project.toml`
     project_dir = dirname(project_toml)
@@ -1747,7 +1807,7 @@ function collect_preferences(project_toml::String, uuid::UUID)
         toml_path = joinpath(project_dir, name)
         if isfile(toml_path)
             prefs = parsed_toml(toml_path)
-            push!(dicts, get(Dict{String, Any}, prefs, pkg_name)::Dict{String,Any})
+            push!(dicts, filter_preferences(prefs, pkg_name))
 
             # If we find `JuliaLocalPreferences.toml`, don't look for `LocalPreferences.toml`
             break
@@ -1788,7 +1848,7 @@ function recursive_prefs_merge(base::Dict{String, Any}, overrides::Dict{String, 
     return new_base
 end
 
-function get_preferences(uuid::UUID)
+function get_preferences(uuid::Union{UUID,Nothing} = nothing)
     merged_prefs = Dict{String,Any}()
     for env in reverse(load_path())
         project_toml = env_project_file(env)
@@ -1842,7 +1902,7 @@ get_compiletime_preferences(::Nothing) = String[]
 
 # returns true if it "cachefile.ji" is stale relative to "modpath.jl"
 # otherwise returns the list of dependencies to also check
-function stale_cachefile(modpath::String, cachefile::String; ignore_loaded = false)
+@constprop :none function stale_cachefile(modpath::String, cachefile::String; ignore_loaded::Bool = false)
     io = open(cachefile, "r")
     try
         if !isvalid_cache_header(io)
@@ -1915,8 +1975,9 @@ function stale_cachefile(modpath::String, cachefile::String; ignore_loaded = fal
                 f, ftime_req = chi.filename, chi.mtime
                 # Issue #13606: compensate for Docker images rounding mtimes
                 # Issue #20837: compensate for GlusterFS truncating mtimes to microseconds
+                # The `ftime != 1.0` condition below provides compatibility with Nix mtime.
                 ftime = mtime(f)
-                if ftime != ftime_req && ftime != floor(ftime_req) && ftime != trunc(ftime_req, digits=6)
+                if ftime != ftime_req && ftime != floor(ftime_req) && ftime != trunc(ftime_req, digits=6) && ftime != 1.0
                     @debug "Rejecting stale cache file $cachefile (mtime $ftime_req) because file $f (mtime $ftime) has changed"
                     return true
                 end
